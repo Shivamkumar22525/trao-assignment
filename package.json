@@ -1,0 +1,21 @@
+{
+  "name": "trao-interview-prep",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": ["client", "server"],
+  "scripts": {
+    "dev:client": "npm --workspace client run dev",
+    "dev:server": "npm --workspace server run dev",
+    "build:client": "npm --workspace client run build",
+    "build:server": "npm --workspace server run build",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "evaluate": "tsx scripts/evaluate.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.10",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.2",
+    "vitest": "^3.0.8"
+  }
+}

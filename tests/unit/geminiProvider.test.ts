@@ -85,17 +85,33 @@ describe("Gemini structured-output provider", () => {
     expect(receivedSignal?.aborted).toBe(true);
   });
 
+  it("does not start a provider request when the parent signal is already aborted", async () => {
+    const controller = new AbortController();
+    controller.abort(new Error("case deadline already reached"));
+    const generateStructured = vi.fn();
+    const pending = generateValidated({ generateStructured }, request.stage, request.systemInstruction, request.userInput, RequirementDraftSchema, 10_000, request.model, controller.signal);
+    await expect(pending).rejects.toThrow("case deadline already reached");
+    expect(generateStructured).not.toHaveBeenCalled();
+  });
+
   it("enforces the stage timeout and aborts the provider retry sequence", async () => {
     vi.useFakeTimers();
     try {
       let receivedSignal: AbortSignal | undefined;
       const pending = generateValidated({ generateStructured: (stageRequest) => {
         receivedSignal = stageRequest.signal;
-        return new Promise(() => {});
+        return new Promise((_resolve, reject) => {
+          stageRequest.signal.addEventListener("abort", () => reject(stageRequest.signal.reason), { once: true });
+        });
       } }, request.stage, request.systemInstruction, request.userInput, RequirementDraftSchema, 20_000, request.model);
+      // Attach the rejection assertion before the fake timer can reject the
+      // caller-facing promise; attaching it after advancing time creates a
+      // transient unhandled rejection even though the later assertion passes.
+      const timeoutAssertion = expect(pending).rejects.toMatchObject({ code: "LLM_TIMEOUT", stage: request.stage });
       await vi.advanceTimersByTimeAsync(20_000);
-      await expect(pending).rejects.toMatchObject({ code: "LLM_TIMEOUT" });
+      await timeoutAssertion;
       expect(receivedSignal?.aborted).toBe(true);
+      expect(receivedSignal?.reason).toMatchObject({ name: "AbortError" });
     } finally { vi.useRealTimers(); }
   });
 

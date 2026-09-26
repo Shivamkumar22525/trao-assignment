@@ -20,26 +20,34 @@ export async function generateValidated<T>(
   model = getLlmConfig().model,
   signal?: AbortSignal,
 ): Promise<T> {
+  // Exit before creating any internal promises when cancellation has already
+  // happened. Otherwise abortPromise could reject before Promise.race observes it.
+  if (signal?.aborted) throw abortReason(signal);
+
   const controller = new AbortController();
   let rejectAbort!: (error: Error) => void;
   const abortPromise = new Promise<never>((_resolve, reject) => { rejectAbort = reject; });
   const onAbort = () => {
     const reason = abortReason(signal);
-    controller.abort(reason);
+    // Keep the parent error on the caller-facing abort race. The provider signal
+    // uses the platform AbortError so SDK retry/cancellation handlers cannot
+    // treat an application GenerationError as a separate unobserved rejection.
     rejectAbort(reason);
+    controller.abort();
   };
   signal?.addEventListener("abort", onAbort, { once: true });
-  if (signal?.aborted) onAbort();
   const request: LlmRequest = { stage, systemInstruction, userInput, model, timeoutMs, signal: controller.signal };
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     const timeout = new Promise<never>((_resolve, reject) => {
       timer = setTimeout(() => {
-        controller.abort(new GenerationError("LLM_TIMEOUT", stage, "The model request timed out."));
-        reject(new GenerationError("LLM_TIMEOUT", stage, "The model request timed out."));
+        const timeoutError = new GenerationError("LLM_TIMEOUT", stage, "The model request timed out.");
+        // Reject the stage race first so an abort-aware provider's cancellation
+        // rejection cannot win with its lower-level AbortError.
+        reject(timeoutError);
+        controller.abort();
       }, timeoutMs);
     });
-    if (controller.signal.aborted) throw abortReason(signal);
     const candidate = await Promise.race([provider.generateStructured<unknown>(request), timeout, abortPromise]);
     const parsed = parseJsonIfText(candidate, stage);
     const result = schema.safeParse(parsed);

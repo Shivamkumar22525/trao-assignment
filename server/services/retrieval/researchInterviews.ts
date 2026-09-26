@@ -5,6 +5,7 @@ import { fetchPage, type FetchPageOptions, type PageFetchResult } from "./fetchP
 import { loadRobotsPolicy, type RobotsPolicy } from "./robots.js";
 import { UrlValidationError, validateUrl } from "./urlSecurity.js";
 import type { FailedSource, InterviewResearchProvider, InterviewResearchResult, InterviewResearchSource, InterviewSourceType, ResolvedAddress, SearchResult } from "./types.js";
+import { abortReason, abortableDelay, raceWithAbort, throwIfAborted } from "../../utils/abort.js";
 
 export interface ResearchInterviewsInput {
   company_url: string;
@@ -20,6 +21,7 @@ export interface ResearchInterviewsOptions {
   fetcher?: (url: string, options?: FetchPageOptions) => Promise<PageFetchResult>;
   now?: () => number;
   sleep?: (milliseconds: number) => Promise<void>;
+  signal?: AbortSignal;
 }
 
 const INTERVIEW_TERMS = /\b(interview|hiring|recruit(?:ment|ing)?|candidate|rounds?|questions?|assessment|coding|technical|behavio[u]?ral|system design|experience)\b/i;
@@ -109,9 +111,10 @@ export async function researchInterviews(input: ResearchInterviewsInput, options
 
   const ranked = new Map<string, { result: SearchResult; url: string; query: string; score: number; queryIndex: number }>();
   for (let queryIndex = 0; queryIndex < queries.length; queryIndex += 1) {
+    throwIfAborted(options.signal);
     const query = queries[queryIndex];
     try {
-      const results = await options.provider.search(query);
+      const results = await raceWithAbort(options.provider.search(query, { signal: options.signal }), options.signal);
       for (const candidate of results.slice(0, config.interviewSearchMaxResultsPerQuery)) {
         const canonical = normalizeUrl(candidate.url);
         if (!canonical) {
@@ -129,25 +132,28 @@ export async function researchInterviews(input: ResearchInterviewsInput, options
         }
       }
     } catch {
+      if (options.signal?.aborted) throw abortReason(options.signal);
       result.search_failures.push({ query, code: "SEARCH_PROVIDER_ERROR", message: "The search provider failed for this query." });
     }
   }
 
   const candidates = [...ranked.values()].sort((a, b) => b.score - a.score || a.queryIndex - b.queryIndex || a.url.localeCompare(b.url));
   const fetcher = options.fetcher ?? fetchPage;
-  const sleep = options.sleep ?? (async (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  const sleep = options.sleep ?? ((ms: number) => abortableDelay(ms, options.signal));
   const robotsByOrigin = new Map<string, Promise<RobotsPolicy>>();
   const requestTimes = new Map<string, number>();
   const beforeRequest = async (origin: string, crawlDelayMs = 0) => {
     const prior = requestTimes.get(origin);
-    if (prior !== undefined) await sleep(Math.max(0, Math.max(config.minRequestIntervalMs, crawlDelayMs) - (Date.now() - prior)));
+    if (prior !== undefined) await raceWithAbort(sleep(Math.max(0, Math.max(config.minRequestIntervalMs, crawlDelayMs) - (Date.now() - prior))), options.signal);
     requestTimes.set(origin, Date.now());
   };
   let totalBytes = 0;
   for (const item of candidates.slice(0, config.interviewResearchMaxSources)) {
+    throwIfAborted(options.signal);
     try {
-      await validateUrl(item.url, { production: config.production, resolveHostname: options.resolveHostname, timeoutMs: config.requestTimeoutMs });
+      await validateUrl(item.url, { production: config.production, resolveHostname: options.resolveHostname, timeoutMs: config.requestTimeoutMs, signal: options.signal });
     } catch (error) {
+      if (options.signal?.aborted) throw abortReason(options.signal);
       const code = error instanceof UrlValidationError ? error.code : "INVALID_URL";
       result.failed_sources.push({ url: item.url, code, message: error instanceof UrlValidationError ? error.message : "The search result URL could not be validated." });
       continue;
@@ -156,7 +162,7 @@ export async function researchInterviews(input: ResearchInterviewsInput, options
     let policyPromise = robotsByOrigin.get(origin);
     if (!policyPromise) {
       policyPromise = loadRobotsPolicy(origin, config, {
-        fetcher: (url, fetchOptions) => fetcher(url, { ...fetchOptions, resolveHostname: options.resolveHostname, sleep }),
+        fetcher: (url, fetchOptions) => fetcher(url, { ...fetchOptions, resolveHostname: options.resolveHostname, sleep, signal: options.signal }),
         beforeRequest: () => beforeRequest(origin),
       }).catch(() => ({
         url: new URL("/robots.txt", origin).href,
@@ -185,10 +191,12 @@ export async function researchInterviews(input: ResearchInterviewsInput, options
         maxResponseBytes: Math.min(config.maxResponseBytes, remaining),
         resolveHostname: options.resolveHostname,
         sleep,
+        signal: options.signal,
         beforeRequest: () => beforeRequest(origin, policy.crawlDelayMs),
         redirectAllowed: (_from, to) => to.origin === origin && policy.isAllowed(to.href),
       });
     } catch {
+      if (options.signal?.aborted) throw abortReason(options.signal);
       result.failed_sources.push({ url: item.url, code: "NETWORK_ERROR", message: "The source could not be fetched." });
       continue;
     }

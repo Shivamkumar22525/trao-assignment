@@ -59,7 +59,7 @@ export interface SearchResult {
 }
 
 export interface InterviewResearchProvider {
-  search(query: string): Promise<SearchResult[]>;
+  search(query: string, options?: { signal?: AbortSignal }): Promise<SearchResult[]>;
 }
 
 export type InterviewSourceType = "company_hiring" | "candidate_experience" | "technical_blog" | "discussion" | "interview_prep" | "public_article" | "other";

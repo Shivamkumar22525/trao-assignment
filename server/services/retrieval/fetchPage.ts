@@ -4,6 +4,7 @@ import type { ResearchConfig } from "./config.js";
 import { getResearchConfig } from "./config.js";
 import { UrlValidationError, validateUrl } from "./urlSecurity.js";
 import type { ResolvedAddress } from "./types.js";
+import { abortReason, abortableDelay, raceWithAbort, throwIfAborted } from "../../utils/abort.js";
 
 export type FetchErrorCode =
   | "INVALID_URL"
@@ -34,6 +35,7 @@ export interface FetchTransportOptions {
   timeoutMs: number;
   maxBytes: number;
   userAgent: string;
+  signal?: AbortSignal;
 }
 
 export type FetchTransport = (
@@ -51,6 +53,7 @@ export interface FetchPageOptions {
   sleep?: (milliseconds: number) => Promise<void>;
   now?: () => number;
   redirectAllowed?: (fromUrl: URL, toUrl: URL) => boolean;
+  signal?: AbortSignal;
 }
 
 class TransportFailure extends Error {
@@ -73,6 +76,7 @@ function normalizeHeaders(headers: http.IncomingHttpHeaders): Record<string, str
 }
 
 const nativeTransport: FetchTransport = (url, addresses, options) => new Promise((resolve, reject) => {
+  if (options.signal?.aborted) { reject(abortReason(options.signal)); return; }
   const destination = addresses[0];
   if (!destination) {
     reject(new TransportFailure("NETWORK_ERROR"));
@@ -131,7 +135,12 @@ const nativeTransport: FetchTransport = (url, addresses, options) => new Promise
 
   const absoluteTimeout = setTimeout(() => request.destroy(new TransportFailure("TIMEOUT")), options.timeoutMs);
   absoluteTimeout.unref?.();
-  request.on("close", () => clearTimeout(absoluteTimeout));
+  const onAbort = () => request.destroy(abortReason(options.signal));
+  options.signal?.addEventListener("abort", onAbort, { once: true });
+  request.on("close", () => {
+    clearTimeout(absoluteTimeout);
+    options.signal?.removeEventListener("abort", onAbort);
+  });
   request.setTimeout(options.timeoutMs, () => request.destroy(new TransportFailure("TIMEOUT")));
   request.on("error", (error: Error) => {
     reject(error instanceof TransportFailure ? error : new TransportFailure("NETWORK_ERROR"));
@@ -163,21 +172,24 @@ export async function fetchPage(inputUrl: string, options: FetchPageOptions = {}
   const config = options.config ?? getResearchConfig();
   const maxBytes = options.maxResponseBytes ?? config.maxResponseBytes;
   const transport = options.transport ?? nativeTransport;
-  const sleep = options.sleep ?? ((milliseconds: number) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds)));
+  const sleep = options.sleep ?? ((milliseconds: number) => abortableDelay(milliseconds, options.signal));
   const now = options.now ?? Date.now;
   let currentUrl = inputUrl;
   let previousUrl: URL | undefined;
   const visited = new Set<string>();
 
   for (let redirectCount = 0; redirectCount <= config.maxRedirects; redirectCount += 1) {
+    throwIfAborted(options.signal);
     let validated;
     try {
       validated = await validateUrl(currentUrl, {
         production: config.production,
         resolveHostname: options.resolveHostname,
         timeoutMs: config.requestTimeoutMs,
+        signal: options.signal,
       });
     } catch (error) {
+      if (options.signal?.aborted) throw abortReason(options.signal);
       if (error instanceof UrlValidationError) return failure(inputUrl, mapValidationCode(error), error.message);
       return failure(inputUrl, "INVALID_URL", "The destination URL could not be validated.");
     }
@@ -194,13 +206,16 @@ export async function fetchPage(inputUrl: string, options: FetchPageOptions = {}
     let retryDelayExceeded = false;
     for (let attempt = 0; attempt <= config.maxRetries; attempt += 1) {
       try {
+        throwIfAborted(options.signal);
         await options.beforeRequest?.();
-        response = await transport(validated.url, validated.addresses, {
+        response = await raceWithAbort(transport(validated.url, validated.addresses, {
           timeoutMs: config.requestTimeoutMs,
           maxBytes,
           userAgent: config.userAgent,
-        });
+          signal: options.signal,
+        }), options.signal);
       } catch (error) {
+        if (options.signal?.aborted) throw abortReason(options.signal);
         if (error instanceof UrlValidationError) return failure(inputUrl, error.code, error.message);
         if (error instanceof TransportFailure) {
           const messages: Record<TransportFailure["code"], string> = {
@@ -220,7 +235,7 @@ export async function fetchPage(inputUrl: string, options: FetchPageOptions = {}
         retryDelayExceeded = true;
         break;
       }
-      await sleep(retryAfter ?? backoff);
+      await raceWithAbort(sleep(retryAfter ?? backoff), options.signal);
     }
 
     if (!response) return failure(inputUrl, "NETWORK_ERROR", "The page could not be fetched.");

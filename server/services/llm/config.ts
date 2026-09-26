@@ -1,4 +1,7 @@
 import { GenerationError } from "./types.js";
+import { createGeminiProvider } from "./providers/gemini.js";
+
+export const DEFAULT_GEMINI_MODEL = "gemini-3.8-flash";
 
 export interface LlmConfig {
   provider: string;
@@ -12,9 +15,9 @@ export interface LlmConfig {
 export function getLlmConfig(env: NodeJS.ProcessEnv = process.env): LlmConfig {
   const timeout = Number(env.LLM_TIMEOUT_MS);
   return {
-    provider: env.LLM_PROVIDER?.trim() ?? "",
-    model: env.LLM_MODEL?.trim() ?? "",
-    apiKey: env.LLM_API_KEY?.trim() ?? "",
+    provider: env.LLM_PROVIDER?.trim() || "gemini",
+    model: env.GEMINI_MODEL?.trim() || DEFAULT_GEMINI_MODEL,
+    apiKey: env.GEMINI_API_KEY?.trim() ?? "",
     timeoutMs: Number.isSafeInteger(timeout) && timeout > 0 ? timeout : 45_000,
     researchContextMaxBytes: positiveInteger(env.LLM_RESEARCH_CONTEXT_MAX_BYTES, 65_536),
     researchContextMaxSources: positiveInteger(env.LLM_RESEARCH_CONTEXT_MAX_SOURCES, 12),
@@ -34,9 +37,9 @@ export function createLlmProvider(
   factories: Readonly<Record<string, LlmProviderFactory>> = {},
 ): import("./types.js").LlmProvider {
   if (!config.provider || !config.model || !config.apiKey) {
-    throw new GenerationError("LLM_NOT_CONFIGURED", "pipeline", "LLM_PROVIDER, LLM_MODEL, and LLM_API_KEY must be configured before generation.");
+    throw new GenerationError("LLM_NOT_CONFIGURED", "pipeline", "Set LLM_PROVIDER=gemini and configure GEMINI_API_KEY; GEMINI_MODEL defaults to a supported Flash model.");
   }
-  const factory = factories[config.provider];
+  const factory = { gemini: createGeminiProvider, ...factories }[config.provider];
   if (!factory) {
     throw new GenerationError("LLM_PROVIDER_UNAVAILABLE", "pipeline", `No adapter is registered for LLM provider '${config.provider}'.`);
   }

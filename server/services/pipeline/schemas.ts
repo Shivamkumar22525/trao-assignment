@@ -19,7 +19,7 @@ export const QuestionDraftSchema = z.object({
     category: z.enum(["technical", "behavioural", "system-design", "company-fit"]),
     prompt: z.string().trim().min(1).max(1200),
     answer_outline: z.string().trim().min(1).max(3000),
-    difficulty: z.union([z.literal(1), z.literal(2), z.literal(3)]),
+    difficulty: z.number().int().min(1).max(3),
   }).strict()).max(100),
 }).strict();
 

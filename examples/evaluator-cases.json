@@ -1,0 +1,14 @@
+[
+  {
+    "id": "sample-typescript-backend",
+    "jd": "Backend Engineer. Required experience with TypeScript and Node.js. Build reliable services.",
+    "company_url": "https://example.com/",
+    "days": 5
+  },
+  {
+    "id": "sample-react-frontend",
+    "jd": "Frontend Engineer. Required experience with React. Build accessible user interfaces.",
+    "company_url": "https://example.org/",
+    "days": 60
+  }
+]

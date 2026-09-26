@@ -1,6 +1,7 @@
 import { researchCompany, type ResearchCompanyOptions } from "./researchCompany.js";
 import { researchInterviews, type ResearchInterviewsOptions } from "./researchInterviews.js";
 import type { CombinedResearchResult, CompanyResearchResult, InterviewResearchResult } from "./types.js";
+import { abortReason } from "../../utils/abort.js";
 
 export interface ResearchCompanyAndInterviewsInput {
   company_url: string;
@@ -12,6 +13,7 @@ export interface ResearchCompanyAndInterviewsInput {
 export interface ResearchCompanyAndInterviewsOptions {
   company?: ResearchCompanyOptions;
   interviews?: ResearchInterviewsOptions;
+  signal?: AbortSignal;
 }
 
 function inferCompanyName(input: ResearchCompanyAndInterviewsInput, company: CompanyResearchResult): string {
@@ -31,15 +33,17 @@ export async function researchCompanyAndInterviews(
 ): Promise<CombinedResearchResult> {
   let company: CompanyResearchResult;
   try {
-    company = await researchCompany(input.company_url, options.company);
+    company = await researchCompany(input.company_url, { ...options.company, signal: options.signal });
   } catch {
+    if (options.signal?.aborted) throw abortReason(options.signal);
     company = { company_url: input.company_url, pages: [], summary_inputs: [], failed_sources: [{ url: input.company_url, code: "COMPANY_RESEARCH_ERROR", message: "Company website research could not be completed." }], robots: { url: "", status: "unavailable", crawl_delay_ms: 0 } };
   }
   const companyName = inferCompanyName(input, company);
   let interviews: InterviewResearchResult;
   try {
-    interviews = await researchInterviews({ ...input, company_name: companyName }, options.interviews);
+    interviews = await researchInterviews({ ...input, company_name: companyName }, { ...options.interviews, signal: options.signal });
   } catch {
+    if (options.signal?.aborted) throw abortReason(options.signal);
     interviews = {
       company_name: companyName, company_url: input.company_url,
       ...(input.role ? { role: input.role } : {}), queries: [], sources: [],

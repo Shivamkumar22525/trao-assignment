@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { getResearchConfig } from "../../server/services/retrieval/config.js";
 import { fetchPage, type FetchTransport } from "../../server/services/retrieval/fetchPage.js";
 
@@ -122,5 +122,41 @@ describe("fetchPage", () => {
     });
     expect(result).toMatchObject({ ok: false, error: { code: "NETWORK_ERROR", message: "The page could not be fetched due to a network error." } });
     expect(JSON.stringify(result)).not.toContain("secret socket detail");
+  });
+
+  it("propagates cancellation to an in-flight fetch transport", async () => {
+    const controller = new AbortController();
+    let transportSignal: AbortSignal | undefined;
+    const pending = fetchPage("https://example.com/", {
+      config,
+      resolveHostname: resolvePublic,
+      signal: controller.signal,
+      transport: async (_url, _addresses, options) => {
+        transportSignal = options.signal;
+        return new Promise(() => {});
+      },
+    });
+    await vi.waitFor(() => expect(transportSignal).toBeDefined());
+    controller.abort(new Error("case deadline"));
+    await expect(pending).rejects.toThrow("case deadline");
+    expect(transportSignal?.aborted).toBe(true);
+  });
+
+  it("cancels a retry wait without issuing the next attempt", async () => {
+    const controller = new AbortController();
+    let sleepCalled!: () => void;
+    const sleepStarted = new Promise<void>((resolve) => { sleepCalled = resolve; });
+    let attempts = 0;
+    const pending = fetchPage("https://example.com/", {
+      config: { ...config, maxRetries: 1, retryBaseDelayMs: 30_000, retryMaxDelayMs: 30_000 },
+      resolveHostname: resolvePublic,
+      signal: controller.signal,
+      sleep: async () => new Promise<void>(() => { sleepCalled(); }),
+      transport: async () => { attempts += 1; return response(503); },
+    });
+    await sleepStarted;
+    controller.abort(new Error("case deadline"));
+    await expect(pending).rejects.toThrow("case deadline");
+    expect(attempts).toBe(1);
   });
 });

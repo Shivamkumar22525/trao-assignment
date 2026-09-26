@@ -1,6 +1,7 @@
 import { lookup } from "node:dns/promises";
 import { isIP } from "node:net";
 import type { ResolvedAddress } from "./types.js";
+import { abortReason, throwIfAborted } from "../../utils/abort.js";
 
 export type UrlValidationErrorCode =
   | "INVALID_URL"
@@ -21,6 +22,7 @@ export interface UrlValidationOptions {
   production?: boolean;
   resolveHostname?: (hostname: string) => Promise<ResolvedAddress[]>;
   timeoutMs?: number;
+  signal?: AbortSignal;
 }
 
 export interface ValidatedUrl {
@@ -131,6 +133,7 @@ function hostnameIsObviousInternal(hostname: string): boolean {
 }
 
 export async function validateUrl(input: string, options: UrlValidationOptions = {}): Promise<ValidatedUrl> {
+  throwIfAborted(options.signal);
   let url: URL;
   try {
     url = new URL(input);
@@ -167,14 +170,19 @@ export async function validateUrl(input: string, options: UrlValidationOptions =
     try {
       const resolver = options.resolveHostname ?? defaultResolver;
       addresses = await new Promise<ResolvedAddress[]>((resolve, reject) => {
-        const timer = setTimeout(() => reject(new Error("DNS validation timed out")), options.timeoutMs ?? 5_000);
-        resolver(hostname).then(
-          (resolved) => { clearTimeout(timer); resolve(resolved); },
-          () => { clearTimeout(timer); reject(new Error("DNS validation failed")); },
+        const cleanup = () => { clearTimeout(timer); options.signal?.removeEventListener("abort", onAbort); };
+        const timer = setTimeout(() => { cleanup(); reject(new Error("DNS validation timed out")); }, options.timeoutMs ?? 5_000);
+        const onAbort = () => { cleanup(); reject(abortReason(options.signal)); };
+        Promise.resolve().then(() => resolver(hostname)).then(
+          (resolved) => { cleanup(); resolve(resolved); },
+          () => { cleanup(); reject(options.signal?.aborted ? abortReason(options.signal) : new Error("DNS validation failed")); },
         );
+        options.signal?.addEventListener("abort", onAbort, { once: true });
+        if (options.signal?.aborted) onAbort();
         timer.unref?.();
       });
     } catch {
+      throwIfAborted(options.signal);
       throw new UrlValidationError("DNS_LOOKUP_FAILED", "The destination hostname could not be resolved safely.");
     }
     if (addresses.length === 0) throw new UrlValidationError("DNS_LOOKUP_FAILED", "The destination hostname returned no addresses.");

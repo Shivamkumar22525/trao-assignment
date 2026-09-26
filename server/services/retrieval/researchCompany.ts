@@ -6,6 +6,7 @@ import { rankLinks } from "./rankLinks.js";
 import { loadRobotsPolicy, type RobotsFetcher } from "./robots.js";
 import { UrlValidationError, validateUrl } from "./urlSecurity.js";
 import type { CompanyResearchResult, DiscoveredLink, FailedSource, ResearchSource, ResolvedAddress } from "./types.js";
+import { abortReason, abortableDelay, raceWithAbort, throwIfAborted } from "../../utils/abort.js";
 
 export interface ResearchCompanyOptions {
   config?: Partial<ResearchConfig>;
@@ -13,6 +14,7 @@ export interface ResearchCompanyOptions {
   fetcher?: (url: string, options?: FetchPageOptions) => Promise<PageFetchResult>;
   sleep?: (milliseconds: number) => Promise<void>;
   now?: () => number;
+  signal?: AbortSignal;
 }
 
 interface CrawlCandidate extends DiscoveredLink {
@@ -45,7 +47,7 @@ export async function researchCompany(
 ): Promise<CompanyResearchResult> {
   const config: ResearchConfig = { ...getResearchConfig(), ...options.config };
   const fetcher = options.fetcher ?? fetchPage;
-  const sleep = options.sleep ?? ((milliseconds: number) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds)));
+  const sleep = options.sleep ?? ((milliseconds: number) => abortableDelay(milliseconds, options.signal));
   const now = options.now ?? Date.now;
   const result: CompanyResearchResult = {
     company_url: companyUrl,
@@ -57,13 +59,16 @@ export async function researchCompany(
 
   let safeCompanyUrl: string;
   try {
+    throwIfAborted(options.signal);
     const validated = await validateUrl(companyUrl, {
       production: config.production,
       resolveHostname: options.resolveHostname,
       timeoutMs: config.requestTimeoutMs,
+      signal: options.signal,
     });
     safeCompanyUrl = normalizeUrl(validated.url.href) ?? validated.url.href;
   } catch (error) {
+    if (options.signal?.aborted) throw abortReason(options.signal);
     const code = error instanceof UrlValidationError ? error.code : "INVALID_URL";
     const message = error instanceof UrlValidationError ? error.message : "The company URL could not be validated.";
     result.failed_sources.push({ url: companyUrl, code, message });
@@ -85,9 +90,10 @@ export async function researchCompany(
   let minIntervalMs = config.minRequestIntervalMs;
   let lastRequestStartedAt: number | undefined;
   const beforeRequest = async () => {
+    throwIfAborted(options.signal);
     if (lastRequestStartedAt !== undefined) {
       const waitMs = Math.max(0, minIntervalMs - (now() - lastRequestStartedAt));
-      if (waitMs > 0) await sleep(waitMs);
+      if (waitMs > 0) await raceWithAbort(sleep(waitMs), options.signal);
     }
     lastRequestStartedAt = now();
   };
@@ -95,7 +101,8 @@ export async function researchCompany(
   const safeFetcher = async (url: string, fetchOptions?: FetchPageOptions): Promise<PageFetchResult> => {
     try {
       return await fetcher(url, fetchOptions);
-    } catch {
+    } catch (error) {
+      if (options.signal?.aborted) throw abortReason(options.signal);
       return { ok: false, url, error: { code: "NETWORK_ERROR", message: "The page could not be fetched due to a network error." } };
     }
   };
@@ -105,6 +112,7 @@ export async function researchCompany(
     resolveHostname: options.resolveHostname,
     sleep,
     now,
+    signal: options.signal,
   });
   const robots = await loadRobotsPolicy(origin, config, { fetcher: robotFetcher, beforeRequest });
   result.robots = { url: robots.url, status: robots.status, crawl_delay_ms: robots.crawlDelayMs };
@@ -158,6 +166,7 @@ export async function researchCompany(
       beforeRequest,
       sleep,
       now,
+      signal: options.signal,
       redirectAllowed: (_from, to) => isSameCompanyDomain(to.href, safeCompanyUrl),
     });
     requestedPages += 1;
@@ -189,6 +198,7 @@ export async function researchCompany(
   if (homepage) enqueueLinks(homepage.source.url, homepage.source.title, homepage.links, 0);
 
   while (queue.length > 0 && requestedPages < config.maxPages && totalBytes < config.maxTotalBytes) {
+    throwIfAborted(options.signal);
     queue.sort(compareCandidates);
     const candidate = queue.shift();
     if (!candidate) break;

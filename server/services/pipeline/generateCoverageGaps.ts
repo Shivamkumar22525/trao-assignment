@@ -11,7 +11,7 @@ export interface GenerateCoverageGapsInput {
 }
 
 /** The second pass receives only uncovered requirements, never the full question bank. */
-export async function generateCoverageGaps(input: GenerateCoverageGapsInput, provider: LlmProvider, options: { timeoutMs?: number; model?: string } = {}): Promise<Question[]> {
+export async function generateCoverageGaps(input: GenerateCoverageGapsInput, provider: LlmProvider, options: { timeoutMs?: number; model?: string; signal?: AbortSignal } = {}): Promise<Question[]> {
   if (input.uncoveredRequirements.length === 0) return [];
   try {
     const questions = await generateQuestions({ requirements: input.uncoveredRequirements, role: input.role, research: input.research, stage: "coverage_gap_generation" }, provider, options);
@@ -21,6 +21,7 @@ export async function generateCoverageGaps(input: GenerateCoverageGapsInput, pro
     }
     return questions;
   } catch (error) {
+    if (options.signal?.aborted) throw options.signal.reason instanceof Error ? options.signal.reason : error;
     if (error instanceof GenerationError) throw error;
     throw new GenerationError("QUESTION_GENERATION_FAILED", "coverage_gap_generation", "Second-pass question generation failed.", error instanceof Error ? error.message : "Unknown generation error.");
   }

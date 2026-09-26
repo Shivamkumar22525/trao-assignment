@@ -3,6 +3,7 @@ import { z } from "zod";
 import { UserModel } from "../models/User.js";
 import { asyncRoute, HttpError } from "../http/errors.js";
 import { requireAuth, readCookie, SESSION_COOKIE, type AuthenticatedRequest } from "../middleware/auth.js";
+import { loginRateLimit, registrationRateLimit } from "../middleware/abuseControls.js";
 import { authenticateUser, createSession, registerUser, revokeSession } from "../services/auth.js";
 
 const CredentialsSchema = z.object({
@@ -14,7 +15,7 @@ const clearCookieOptions = () => `Path=/api; HttpOnly; SameSite=Lax; Max-Age=0${
 const userResponse = (user: { _id: unknown; email: string }) => ({ id: String(user._id), email: user.email });
 
 export const authRouter = Router();
-authRouter.post("/register", asyncRoute(async (request, response) => {
+authRouter.post("/register", registrationRateLimit, asyncRoute(async (request, response) => {
   const input = CredentialsSchema.parse(request.body);
   const user = await registerUser(input.email, input.password);
   const session = await createSession(user._id);
@@ -22,7 +23,7 @@ authRouter.post("/register", asyncRoute(async (request, response) => {
   response.status(201).json({ user: userResponse(user) });
 }));
 
-authRouter.post("/login", asyncRoute(async (request, response) => {
+authRouter.post("/login", loginRateLimit, asyncRoute(async (request, response) => {
   const input = CredentialsSchema.parse(request.body);
   const user = await authenticateUser(input.email, input.password);
   if (!user) throw new HttpError(401, "INVALID_CREDENTIALS", "Email or password is incorrect.");

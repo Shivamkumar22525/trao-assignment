@@ -5,9 +5,12 @@ import { connectDatabase } from "./db/connect.js";
 import { apiErrorHandler, notFoundHandler } from "./http/errors.js";
 import { authRouter } from "./routes/auth.js";
 import { kitsRouter } from "./routes/kits.js";
+import { getAbuseControlConfig } from "./middleware/abuseControls.js";
 
 // The API is server-only; support either repo-root .env or server/.env in local development.
 dotenv.config({ path: [resolve(process.cwd(), ".env"), resolve(process.cwd(), "server/.env"), resolve(process.cwd(), "../.env")] });
+// Validate rate/capacity settings after dotenv is loaded and before serving requests.
+getAbuseControlConfig();
 
 export const app = express();
 app.use(express.json({ limit: "1mb" }));

@@ -95,6 +95,7 @@ vi.mock("../fixtures/valid-kit.js", () => ({ validKit: {
 
 const { app } = await import("../../server/app.js");
 const { validKit } = await import("../fixtures/valid-kit.js");
+const { resetAbuseControlsForTests } = await import("../../server/middleware/abuseControls.js");
 let server: Server;
 let baseUrl: string;
 
@@ -118,11 +119,109 @@ beforeAll(async () => {
 afterAll(async () => { await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve())); });
 
 beforeEach(() => {
+  resetAbuseControlsForTests();
   state.users = []; state.sessions = []; state.kits = []; state.jobs = []; state.kitFilters = []; state.kitListFilters = []; state.jobUpdates = []; state.practice = [];
   state.generation = { status: "failed", kit: null, warnings: [], uncovered_requirement_ids: [], error: { code: "LLM_NOT_CONFIGURED", stage: "pipeline", message: "Set GEMINI_API_KEY." } };
 });
 
 describe("backend auth and kit routes", () => {
+  it("rate-limits registration and login with generic sanitized responses", async () => {
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const response = await fetch(`${baseUrl}/api/auth/register`, {
+        method: "POST", headers: { "content-type": "application/json", "x-forwarded-for": `198.51.100.${attempt}` },
+        body: JSON.stringify({ email: "bad", password: "short" }),
+      });
+      expect(response.status).toBe(400);
+    }
+    const registerLimited = await fetch(`${baseUrl}/api/auth/register`, {
+      method: "POST", headers: { "content-type": "application/json", "x-forwarded-for": "198.51.100.99" },
+      body: JSON.stringify({ email: "bad", password: "short" }),
+    });
+    expect(registerLimited.status).toBe(429);
+    expect(await registerLimited.json()).toEqual({ error: { code: "RATE_LIMITED", message: "Too many requests. Please try again later." } });
+
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      const response = await fetch(`${baseUrl}/api/auth/login`, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ email: "not-an-email", password: "short" }),
+      });
+      expect(response.status).toBe(400);
+    }
+    const loginLimited = await fetch(`${baseUrl}/api/auth/login`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ email: "person@example.com", password: "wrong-password" }),
+    });
+    expect(loginLimited.status).toBe(429);
+    const loginBody = await loginLimited.text();
+    expect(loginBody).toContain('"code":"RATE_LIMITED"');
+    expect(loginBody).not.toContain("person@example.com");
+    expect(loginBody).not.toContain("wrong-password");
+  });
+
+  it("rate-limits generation per authenticated user without trusting body identity", async () => {
+    const cookie = await register();
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const response = await fetch(`${baseUrl}/api/kits`, {
+        method: "POST", headers: { cookie, "content-type": "application/json" },
+        body: JSON.stringify({ jd: "", company_url: "https://example.com", days: 5, userId: `user-${attempt}` }),
+      });
+      expect(response.status).toBe(400);
+    }
+    const limited = await fetch(`${baseUrl}/api/kits`, {
+      method: "POST", headers: { cookie, "content-type": "application/json" },
+      body: JSON.stringify({ jd: "Engineer", company_url: "https://example.com", days: 5 }),
+    });
+    expect(limited.status).toBe(429);
+    const limitedBody = await limited.json();
+    expect(limitedBody).toEqual({ error: { code: "GENERATION_LIMITED", message: "Generation capacity is currently limited. Please try again later." } });
+    expect(JSON.stringify(limitedBody)).not.toContain("user-");
+    expect(state.jobs).toHaveLength(0);
+  });
+
+  it("enforces per-user concurrency atomically and releases reservations after failure", async () => {
+    let notifyStarted!: () => void;
+    let resolveGeneration!: (value: typeof state.generation) => void;
+    const started = new Promise<void>((resolve) => { notifyStarted = resolve; });
+    const pending = new Promise<typeof state.generation>((resolve) => { resolveGeneration = resolve; });
+    const { generateKit } = await import("../../server/services/pipeline/generateKit.js");
+    vi.mocked(generateKit).mockImplementationOnce(async () => { notifyStarted(); return pending; });
+    const userACookie = await register("first@example.com");
+    const firstRequest = fetch(`${baseUrl}/api/kits`, {
+      method: "POST", headers: { cookie: userACookie, "content-type": "application/json" },
+      body: JSON.stringify({ jd: "Engineer", company_url: "https://example.com", days: 5 }),
+    });
+    await started;
+
+    const duplicate = await fetch(`${baseUrl}/api/kits`, {
+      method: "POST", headers: { cookie: userACookie, "content-type": "application/json" },
+      body: JSON.stringify({ jd: "Engineer", company_url: "https://example.com", days: 5 }),
+    });
+    expect(duplicate.status).toBe(429);
+    expect(await duplicate.json()).toEqual({ error: { code: "GENERATION_LIMITED", message: "Generation capacity is currently limited. Please try again later." } });
+
+    const userBCookie = await register("second@example.com");
+    const otherUser = await fetch(`${baseUrl}/api/kits`, {
+      method: "POST", headers: { cookie: userBCookie, "content-type": "application/json" },
+      body: JSON.stringify({ jd: "Engineer", company_url: "https://example.com", days: 5 }),
+    });
+    expect(otherUser.status).toBe(502);
+
+    resolveGeneration(state.generation);
+    expect((await firstRequest).status).toBe(502);
+    vi.mocked(generateKit).mockRejectedValueOnce(new Error("raw upstream secret detail"));
+    const thrown = await fetch(`${baseUrl}/api/kits`, {
+      method: "POST", headers: { cookie: userACookie, "content-type": "application/json" },
+      body: JSON.stringify({ jd: "Engineer", company_url: "https://example.com", days: 5 }),
+    });
+    expect(thrown.status).toBe(500);
+    expect(await thrown.text()).not.toContain("raw upstream secret detail");
+    const subsequent = await fetch(`${baseUrl}/api/kits`, {
+      method: "POST", headers: { cookie: userACookie, "content-type": "application/json" },
+      body: JSON.stringify({ jd: "Engineer", company_url: "https://example.com", days: 5 }),
+    });
+    expect(subsequent.status).toBe(502);
+  });
+
   it("registers with a password hash and opaque HttpOnly session cookie, then serves current user", async () => {
     const response = await fetch(`${baseUrl}/api/auth/register`, {
       method: "POST", headers: { "content-type": "application/json" },
@@ -211,6 +310,13 @@ describe("backend auth and kit routes", () => {
     const createdBody = await created.json() as { kit: { id: string; generated_kit: unknown; editor_state: unknown } };
     expect(createdBody.kit.generated_kit).toEqual(validKit);
     expect(createdBody.kit.editor_state).toEqual({ edits: [] });
+    state.generation = { status: "failed", kit: null, warnings: [], uncovered_requirement_ids: [], error: { code: "LLM_NOT_CONFIGURED", stage: "pipeline", message: "Provider unavailable." } };
+    const afterSuccessfulGeneration = await fetch(`${baseUrl}/api/kits`, {
+      method: "POST", headers: { cookie, "content-type": "application/json" },
+      body: JSON.stringify({ jd: "Another engineer role", company_url: "https://example.com", days: 1 }),
+    });
+    expect(afterSuccessfulGeneration.status).toBe(502);
+    expect(state.kits).toHaveLength(1);
     const path = `/api/kits/${createdBody.kit.id}`;
     const edited = await fetch(`${baseUrl}${path}`, {
       method: "PATCH", headers: { cookie, "content-type": "application/json" },

@@ -10,6 +10,7 @@ import { checkCoverage } from "../services/coverage/checkCoverage.js";
 import { buildSchedule } from "../services/scheduler/buildSchedule.js";
 import { HttpError, asyncRoute } from "../http/errors.js";
 import { requireAuth, type AuthenticatedRequest } from "../middleware/auth.js";
+import { generationConcurrency, generationRateLimit } from "../middleware/abuseControls.js";
 
 const GenerateInputSchema = z.object({
   jd: z.string().trim().min(1).max(30_000),
@@ -89,11 +90,18 @@ function serializeKit(document: KitRecord) {
 export const kitsRouter = Router();
 kitsRouter.use(requireAuth);
 
-kitsRouter.post("/", asyncRoute(async (request, response) => {
+kitsRouter.post("/", generationRateLimit, asyncRoute(async (request, response) => {
   const input = GenerateInputSchema.parse(request.body);
   const userId = (request as AuthenticatedRequest).userId!;
-  const job = await GenerationJobModel.create({ userId, status: "running", currentStage: "generation", progress: 10, errors: [] });
+  const releaseGeneration = generationConcurrency.acquire(userId);
+  if (!releaseGeneration) {
+    response.status(429).json({ error: { code: "GENERATION_LIMITED", message: "Generation capacity is currently limited. Please try again later." } });
+    return;
+  }
+  let jobId: unknown;
   try {
+    const job = await GenerationJobModel.create({ userId, status: "running", currentStage: "generation", progress: 10, errors: [] });
+    jobId = job._id;
     const result = await generateKit(input);
     if (result.status === "failed" || !result.kit) {
       const error = result.error ?? { code: "GENERATION_FAILED", stage: "pipeline", message: "Kit generation failed." };
@@ -109,10 +117,14 @@ kitsRouter.post("/", asyncRoute(async (request, response) => {
     });
     response.status(201).json({ job: { id: String(job._id), status: "succeeded" }, kit: serializeKit(kit) });
   } catch (error) {
-    await GenerationJobModel.updateOne({ _id: job._id, userId }, {
-      $set: { status: "failed", currentStage: "persistence", progress: 100, errors: [{ code: "GENERATION_FAILED", message: "Kit generation or persistence failed." }] },
-    }).catch(() => undefined);
+    if (jobId !== undefined) {
+      await GenerationJobModel.updateOne({ _id: jobId, userId }, {
+        $set: { status: "failed", currentStage: "persistence", progress: 100, errors: [{ code: "GENERATION_FAILED", message: "Kit generation or persistence failed." }] },
+      }).catch(() => undefined);
+    }
     throw error;
+  } finally {
+    releaseGeneration();
   }
 }));
 
